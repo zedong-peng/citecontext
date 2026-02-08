@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import datetime
 import hashlib
 import json
 import random
@@ -8,7 +9,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from typing import Any
+from typing import Any, Iterable
 
 from .cache import CacheConfig, JsonDiskCache, now_ts
 
@@ -36,6 +37,7 @@ class SemanticScholarClient:
         self.max_retries = max(0, max_retries)
         self._last_request_ts = 0.0
         self._cache = JsonDiskCache(CacheConfig(cache_dir=cache_dir, ttl_hours=cache_ttl_hours))
+        self._author_earliest_year_mem: dict[str, int | None] = {}
 
     def _throttle(self) -> None:
         if self.min_interval_sec <= 0:
@@ -104,6 +106,61 @@ class SemanticScholarClient:
                 time.sleep(min(10.0, backoff))
                 backoff = min(60.0, backoff * 2.0)
 
+    def _author_has_paper_up_to_year(self, author_id: str, year: int) -> bool:
+        data = self._request_json(
+            f"/author/{urllib.parse.quote(author_id)}/papers",
+            {
+                "limit": 1,
+                "offset": 0,
+                "fields": "year",
+                "publicationDateOrYear": f":{int(year)}",
+            },
+        )
+        batch = data.get("data") or []
+        return len(batch) > 0
+
+    def get_author_earliest_publication_year(
+        self,
+        author_id: str,
+        *,
+        min_year: int = 1800,
+        max_year: int | None = None,
+    ) -> int | None:
+        """Return the earliest publication year for an author (best-effort exact).
+
+        Uses a binary search over the `publicationDateOrYear` filter with `limit=1`,
+        avoiding downloading an author's full paper list.
+        """
+        author_id = (author_id or "").strip()
+        if not author_id:
+            return None
+
+        if author_id in self._author_earliest_year_mem:
+            return self._author_earliest_year_mem[author_id]
+
+        if max_year is None:
+            max_year = datetime.date.today().year
+
+        min_year = int(min_year)
+        max_year = int(max_year)
+        if min_year > max_year:
+            min_year, max_year = max_year, min_year
+
+        if not self._author_has_paper_up_to_year(author_id, max_year):
+            self._author_earliest_year_mem[author_id] = None
+            return None
+
+        lo, hi = min_year, max_year
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if self._author_has_paper_up_to_year(author_id, mid):
+                hi = mid
+            else:
+                lo = mid + 1
+
+        self._author_earliest_year_mem[author_id] = lo
+        return lo
+
     def resolve_author(self, name: str, *, affiliation_keyword: str | None, strict: bool) -> dict[str, Any]:
         data = self._request_json(
             "/author/search",
@@ -158,12 +215,15 @@ class SemanticScholarClient:
         return papers
 
     def iter_paper_citations(self, paper_id: str, *, max_items: int) -> list[dict[str, Any]]:
-        citations: list[dict[str, Any]] = []
+        return list(self.iter_paper_citations_iter(paper_id, max_items=max_items))
+
+    def iter_paper_citations_iter(self, paper_id: str, *, max_items: int) -> Iterable[dict[str, Any]]:
         offset = 0
         limit = 100
+        seen = 0
         max_items = max(0, max_items)
-        while len(citations) < max_items:
-            request_limit = min(limit, max_items - len(citations))
+        while seen < max_items:
+            request_limit = min(limit, max_items - seen)
             data = self._request_json(
                 f"/paper/{urllib.parse.quote(paper_id)}/citations",
                 {
@@ -173,10 +233,15 @@ class SemanticScholarClient:
                 },
             )
             batch = data.get("data") or []
-            citations.extend(batch)
-            if len(batch) == 0 or len(batch) < request_limit:
+            if not batch:
+                break
+            for item in batch:
+                yield item
+                seen += 1
+                if seen >= max_items:
+                    break
+            if len(batch) < request_limit:
                 break
             offset += limit
             if offset > 50_000:
                 break
-        return citations

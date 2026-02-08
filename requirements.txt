@@ -1,0 +1,4 @@
+ddgs
+requests
+beautifulsoup4
+tqdm

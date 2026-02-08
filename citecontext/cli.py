@@ -44,7 +44,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--influential_only",
         action=argparse.BooleanOptionalAction,
-        default=True,
+        default=False,
         help="Keep only Highly Influential Citations (isInfluential == true) when available.",
     )
     parser.add_argument(
@@ -61,6 +61,15 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=280,
         help="Max chars for the context cell in Markdown.",
+    )
+    parser.add_argument(
+        "--earliest_author_cutoff_year",
+        type=int,
+        default=2015,
+        help=(
+            "Speed/heuristic: only consider authors who have >=1 paper at or before this year "
+            "when selecting the earliest-publishing author. Set <=0 to disable."
+        ),
     )
 
     parser.add_argument(
@@ -107,6 +116,7 @@ def main(argv: list[str] | None = None) -> int:
         output_json=args.output_json,
         output_md=args.output_md,
         max_context_chars=args.max_context_chars,
+        earliest_author_cutoff_year=(args.earliest_author_cutoff_year if args.earliest_author_cutoff_year > 0 else None),
         api_key=api_key,
         cache_dir=args.cache_dir,
         timeout_sec=args.timeout_sec,

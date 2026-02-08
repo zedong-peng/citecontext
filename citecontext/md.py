@@ -4,15 +4,29 @@ from typing import Any
 
 
 DEFAULT_MD_HEADERS = [
-    "被引论文（Jieru Zhao）",
+    "被引论文",
     "被引 venue / 年份",
     "引用论文",
     "引用 venue / 年份",
-    "第一作者",
-    "最后作者（通讯近似）",
-    "Highly Influential",
+    "引用作者中最早发文者",
     "原文引用句（英文）",
 ]
+
+ENRICHED_MD_HEADERS = [
+    "被引论文",
+    "被引 venue / 年份",
+    "引用论文",
+    "引用 venue / 年份",
+    "引用作者中最早发文者",
+    "Title sum",
+    "原文引用句（英文）",
+]
+
+
+def md_headers_for_records(records: list[dict[str, Any]]) -> list[str]:
+    """Return column headers for Markdown output."""
+    has_enrichment = any((r.get("citing_earliest_author_title_sum") or "").strip() for r in records)
+    return ENRICHED_MD_HEADERS if has_enrichment else DEFAULT_MD_HEADERS
 
 
 def md_escape_cell(value: Any) -> str:
@@ -69,6 +83,8 @@ def pick_context(contexts: Any, *, max_chars: int) -> str:
 
 
 def records_to_md_rows(records: list[dict[str, Any]], *, max_context_chars: int) -> list[list[Any]]:
+    has_enrichment = any((r.get("citing_earliest_author_title_sum") or "").strip() for r in records)
+
     def sort_key(r: dict[str, Any]) -> tuple[int, int, str, str]:
         cited_cc = int(((r.get("cited_paper") or {}).get("citationCount")) or 0)
         citing_cc = int(((r.get("citing_paper") or {}).get("citationCount")) or 0)
@@ -87,25 +103,37 @@ def records_to_md_rows(records: list[dict[str, Any]], *, max_context_chars: int)
         citing_title = md_link(citing.get("title"), citing.get("url"))
         citing_vy = venue_year(citing.get("venue"), citing.get("year"))
 
-        first_author = r.get("citing_first_author") or ""
-        last_author = r.get("citing_last_author") or ""
-
-        influential = r.get("isInfluential")
-        influential_cell = "" if influential is None else ("yes" if influential else "no")
+        earliest = r.get("citing_earliest_author") or {}
+        earliest_name = (earliest.get("name") or "").strip()
+        earliest_year = earliest.get("earliest_publication_year")
+        earliest_cell = (
+            f"{earliest_name} ({earliest_year})" if earliest_name and earliest_year else (earliest_name or "")
+        )
 
         context = pick_context(r.get("citation_contexts"), max_chars=max_context_chars)
 
-        rows.append(
-            [
-                cited_title,
-                cited_vy,
-                citing_title,
-                citing_vy,
-                first_author,
-                last_author,
-                influential_cell,
-                context,
-            ]
-        )
+        if has_enrichment:
+            title_sum = r.get("citing_earliest_author_title_sum") or ""
+            rows.append(
+                [
+                    cited_title,
+                    cited_vy,
+                    citing_title,
+                    citing_vy,
+                    earliest_cell,
+                    title_sum,
+                    context,
+                ]
+            )
+        else:
+            rows.append(
+                [
+                    cited_title,
+                    cited_vy,
+                    citing_title,
+                    citing_vy,
+                    earliest_cell,
+                    context,
+                ]
+            )
     return rows
-

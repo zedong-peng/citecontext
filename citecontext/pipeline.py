@@ -6,7 +6,8 @@ from dataclasses import dataclass
 from typing import Any
 
 from .semanticscholar import SemanticScholarClient
-from .md import DEFAULT_MD_HEADERS, records_to_md_rows, render_markdown_table
+from .md import md_headers_for_records, records_to_md_rows, render_markdown_table
+from .progress import tqdm
 
 
 @dataclass(frozen=True)
@@ -23,6 +24,7 @@ class RunConfig:
     output_json: str
     output_md: str
     max_context_chars: int
+    earliest_author_cutoff_year: int | None
     api_key: str | None
     cache_dir: str
     timeout_sec: float
@@ -31,11 +33,53 @@ class RunConfig:
     strict_disambiguation: bool
 
 
-def _extract_first_last_author(paper: dict[str, Any]) -> tuple[str, str]:
+def _pick_earliest_publishing_author(
+    client: SemanticScholarClient,
+    paper: dict[str, Any],
+    *,
+    earliest_year_cache: dict[str, int | None],
+    cutoff_year: int | None,
+) -> dict[str, Any] | None:
     authors = paper.get("authors") or []
-    first = ((authors[0] or {}).get("name") or "").strip() if authors else ""
-    last = ((authors[-1] or {}).get("name") or "").strip() if authors else ""
-    return first, last
+    if not authors:
+        return None
+
+    best: dict[str, Any] | None = None
+    best_year: int | None = None
+
+    for a in authors:
+        if not isinstance(a, dict):
+            continue
+        author_id = (a.get("authorId") or "").strip()
+        name = (a.get("name") or "").strip()
+        if not name and not author_id:
+            continue
+
+        year: int | None = None
+        if author_id:
+            if author_id not in earliest_year_cache:
+                earliest_year_cache[author_id] = client.get_author_earliest_publication_year(
+                    author_id,
+                    max_year=cutoff_year,
+                )
+            year = earliest_year_cache[author_id]
+
+        if year is None:
+            continue
+
+        if best_year is None or year < best_year:
+            best_year = year
+            best = {"authorId": author_id or None, "name": name or None, "earliest_publication_year": year}
+
+    if best is not None:
+        return best
+
+    first = authors[0] if isinstance(authors[0], dict) else {}
+    return {
+        "authorId": (first.get("authorId") or None) if isinstance(first, dict) else None,
+        "name": ((first.get("name") or "").strip() or None) if isinstance(first, dict) else None,
+        "earliest_publication_year": None,
+    }
 
 
 def _top_k_papers_by_citation_count(papers: list[dict[str, Any]], k: int) -> list[dict[str, Any]]:
@@ -76,32 +120,46 @@ def run(cfg: RunConfig) -> None:
         raise RuntimeError(f"No papers found for authorId={author_id}")
 
     records: list[dict[str, Any]] = []
-    for cited_paper in target_papers:
+    earliest_year_cache: dict[str, int | None] = {}
+    for cited_paper in tqdm(target_papers, total=len(target_papers), desc="Target papers"):
         cited_paper_id = cited_paper.get("paperId") or ""
         if not cited_paper_id:
             continue
 
         heap: list[tuple[int, int, dict[str, Any]]] = []
         tie = 0
-        citations = client.iter_paper_citations(cited_paper_id, max_items=max(0, cfg.scan_citations_per_paper))
-        for citation in citations:
-            if cfg.influential_only and citation.get("isInfluential") is False:
-                continue
-            citing = citation.get("citingPaper") or {}
-            contexts = citation.get("contexts") or []
-            if cfg.require_context and not contexts:
-                continue
 
-            citing_cc = int(citing.get("citationCount") or 0)
-            tie += 1
-            heapq.heappush(heap, (citing_cc, tie, citation))
-            if len(heap) > max(1, cfg.top_citations_per_paper):
-                heapq.heappop(heap)
+        with tqdm(
+            total=max(0, cfg.scan_citations_per_paper),
+            desc="  Scanning citations",
+            leave=False,
+        ) as pbar:
+            for citation in client.iter_paper_citations_iter(
+                cited_paper_id, max_items=max(0, cfg.scan_citations_per_paper)
+            ):
+                pbar.update(1)
+                if cfg.influential_only and citation.get("isInfluential") is False:
+                    continue
+                citing = citation.get("citingPaper") or {}
+                contexts = citation.get("contexts") or []
+                if cfg.require_context and not contexts:
+                    continue
+
+                citing_cc = int(citing.get("citationCount") or 0)
+                tie += 1
+                heapq.heappush(heap, (citing_cc, tie, citation))
+                if len(heap) > max(1, cfg.top_citations_per_paper):
+                    heapq.heappop(heap)
 
         top = sorted(heap, key=lambda t: t[0], reverse=True)
         for _, __, citation in top:
             citing = citation.get("citingPaper") or {}
-            first_author, last_author = _extract_first_last_author(citing)
+            earliest_author = _pick_earliest_publishing_author(
+                client,
+                citing,
+                earliest_year_cache=earliest_year_cache,
+                cutoff_year=cfg.earliest_author_cutoff_year,
+            )
 
             records.append(
                 {
@@ -124,12 +182,7 @@ def run(cfg: RunConfig) -> None:
                         "externalIds": citing.get("externalIds"),
                         "url": citing.get("url"),
                     },
-                    "citing_first_author": first_author,
-                    "citing_last_author": last_author,
-                    "corresponding_author_assumption": "last_author",
-                    "citing_last_author_is_IEEE_Fellow": None,
-                    "citing_last_author_position": None,
-                    "isInfluential": citation.get("isInfluential"),
+                    "citing_earliest_author": earliest_author,
                     "citation_contexts": citation.get("contexts") or [],
                 }
             )
@@ -155,7 +208,8 @@ def run(cfg: RunConfig) -> None:
     with open(cfg.output_json, "w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False, indent=2)
 
+    md_headers = md_headers_for_records(records)
     md_rows = records_to_md_rows(records, max_context_chars=cfg.max_context_chars)
-    md = render_markdown_table(DEFAULT_MD_HEADERS, md_rows)
+    md = render_markdown_table(md_headers, md_rows)
     with open(cfg.output_md, "w", encoding="utf-8") as f:
         f.write(md)
